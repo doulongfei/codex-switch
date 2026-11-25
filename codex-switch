@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Switch Codex between its existing ChatGPT login and the official OpenAI API."""
+import argparse
+import getpass
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+VERSION = "1.1.0"
+PROVIDER = "codex_switch_openai_api"
+BEGIN = "# >>> codex-switch managed provider: begin >>>"
+END = "# <<< codex-switch managed provider: end <<<"
+
+
+def paths():
+    home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    data = home / "codex-switch"
+    return home / "config.toml", data, data / "openai-api-key", data / "state.json"
+
+
+def die(message):
+    print("codex-switch: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read(path):
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def atomic_write(path, value, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def root_value(text, key):
+    in_table = False
+    found = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            in_table = True
+        if not in_table and s.startswith(key + " ="):
+            try:
+                found.append(json.loads(s.split("=", 1)[1].split("#", 1)[0].strip()))
+            except Exception:
+                die("无法安全解析 config.toml 的顶层 " + key + " 配置")
+    if len(found) > 1:
+        die("config.toml 存在重复的顶层 " + key + " 配置")
+    return (True, found[0]) if found else (False, None)
+
+
+def set_root(text, key, value):
+    lines = text.splitlines()
+    in_table = False
+    index = None
+    first_table = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("["):
+            in_table = True
+            if first_table is None:
+                first_table = i
+        if not in_table and s.startswith(key + " ="):
+            if index is not None:
+                die("config.toml 存在重复的顶层 " + key + " 配置")
+            index = i
+    if index is not None:
+        if value is None:
+            del lines[index]
+        else:
+            lines[index] = key + " = " + json.dumps(value) 
+    elif value is not None:
+        line = key + " = " + json.dumps(value)
+        if first_table is None:
+            lines.append(line)
+        else:
+            lines.insert(first_table, line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def provider_block():
+    command = str(Path(sys.argv[0]).resolve())
+    _, data, key, _ = paths()
+    return "\n".join([
+        BEGIN,
+        "[model_providers." + PROVIDER + "]",
+        'name = "OpenAI API (codex-switch)"',
+        'base_url = "https://api.openai.com/v1"',
+        'wire_api = "responses"',
+        "",
+        "[model_providers." + PROVIDER + ".auth]",
+        "command = " + json.dumps(command),
+        'args = ["print-api-key", "--key-file", ' + json.dumps(str(key)) + "]",
+        "timeout_ms = 5000",
+        "refresh_interval_ms = 0",
+        END,
+    ])
+
+
+def register_provider(text):
+    block = provider_block()
+    if (BEGIN in text) != (END in text):
+        die("检测到不完整的 codex-switch 配置标记，拒绝修改")
+    if BEGIN in text:
+        a, b = text.index(BEGIN), text.index(END) + len(END)
+        return text[:a] + block + text[b:]
+    if "[model_providers." + PROVIDER + "]" in text:
+        die("Provider 已存在但不属于 codex-switch，拒绝覆盖")
+    return text.rstrip() + ("\n\n" if text.strip() else "") + block + "\n"
+
+
+def load_state(path):
+    if not path.exists():
+        return None
+    try:
+        return json.loads(read(path))
+    except Exception:
+        die("切换状态文件损坏，拒绝自动恢复")
+
+
+def save_state(path, state):
+    atomic_write(path, json.dumps(state, indent=2) + "\n")
+
+
+def command_install(args):
+    config, data, key, state = paths()
+    data.mkdir(parents=True, exist_ok=True)
+    os.chmod(data, 0o700)
+    target_dir = Path(args.bin_dir or Path.home() / ".local/bin").expanduser()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "codex-switch"
+    source = Path(__file__).resolve()
+    if source != target.resolve():
+        shutil.copy2(source, target)
+    os.chmod(target, 0o755)
+    original = read(config)
+    backup = config.with_name("config.toml.codex-switch.bak")
+    if config.exists() and not backup.exists():
+        shutil.copy2(config, backup)
+        os.chmod(backup, 0o600)
+    updated = register_provider(original)
+    atomic_write(config, updated)
+    print("codex-switch 已安装。")
+    print("命令位置：" + str(target))
+    print("下一步：codex-switch set-key")
+
+
+def command_key(args):
+    config, data, key, state = paths()
+    data.mkdir(parents=True, exist_ok=True)
+    os.chmod(data, 0o700)
+    if args.from_env:
+        value = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not value:
+            die("环境变量 OPENAI_API_KEY 未设置")
+    else:
+        value = getpass.getpass("OpenAI Platform API Key（输入不回显）：").strip()
+        confirm = getpass.getpass("再次输入 API Key：").strip()
+        if value != confirm:
+            die("两次输入的 API Key 不一致")
+    if not value or any(c.isspace() for c in value):
+        die("API Key 为空或格式异常")
+    atomic_write(key, value + "\n")
+    print("API Key 已安全保存（文件权限 600）。")
+
+
+def command_print_key(args):
+    _, _, default_key, _ = paths()
+    key = Path(args.key_file).expanduser() if args.key_file else default_key
+    if not key.is_file():
+        die("API Key 未配置，请先运行 codex-switch set-key")
+    value = read(key).strip()
+    if not value:
+        die("API Key 文件为空")
+    print(value)
+
+
+def command_api(args):
+    config, data, key, state_path = paths()
+    if not config.exists():
+        die("找不到 config.toml，请先运行 codex-switch install")
+    if not key.is_file():
+        die("API Key 未配置，请先运行 codex-switch set-key")
+    text = read(config)
+    active, profile = root_value(text, "profile")
+    if active and profile:
+        die("检测到顶层 profile 配置；当前版本不自动修改 Profile")
+    present, old_provider = root_value(text, "model_provider")
+    state = load_state(state_path)
+    if old_provider != PROVIDER:
+        _, old_model = root_value(text, "model")
+        model_present, _ = root_value(text, "model")
+        state = {"provider_present": present, "provider": old_provider,
+                 "model_present": model_present, "model": old_model,
+                 "model_override": bool(args.model)}
+    elif state is None:
+        die("当前已是 API Provider，但缺少恢复状态")
+    if args.model:
+        text = set_root(text, "model", args.model)
+        state["model_override"] = True
+    text = set_root(text, "model_provider", PROVIDER)
+    save_state(state_path, state)
+    atomic_write(config, text)
+    print("已切换到 OpenAI 官方 API Provider。")
+    print("请完全退出并重新启动 Codex Desktop；运行中的会话不会热切换。")
+
+
+def command_sub(args):
+    config, data, key, state_path = paths()
+    text = read(config)
+    state = load_state(state_path)
+    if not state:
+        die("没有可恢复的切换状态")
+    text = set_root(text, "model_provider", state["provider"] if state["provider_present"] else None)
+    if state.get("model_override"):
+        text = set_root(text, "model", state["model"] if state["model_present"] else None)
+    atomic_write(config, text)
+    state_path.unlink(missing_ok=True)
+    print("已恢复切换前的 Provider。ChatGPT 登录凭证未被修改。")
+    print("Codex Desktop 需要完全退出并重新启动。")
+
+
+def command_status(args):
+    config, data, key, state = paths()
+    text = read(config)
+    present, provider = root_value(text, "model_provider")
+    print("Codex 配置：" + str(config))
+    print("当前模式：" + ("OpenAI API" if provider == PROVIDER else "订阅/其他 Provider"))
+    print("API Key：" + ("已配置" if key.is_file() and key.stat().st_size else "未配置"))
+    print("Provider：" + ("已注册" if BEGIN in text and END in text else "未注册"))
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "print-api-key":
+        p = argparse.ArgumentParser()
+        p.add_argument("--key-file")
+        command_print_key(p.parse_args(sys.argv[2:]))
+        return
+    p = argparse.ArgumentParser(prog="codex-switch")
+    p.add_argument("--version", action="version", version="codex-switch " + VERSION)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    x = sp.add_parser("install"); x.add_argument("--bin-dir"); x.set_defaults(func=command_install)
+    x = sp.add_parser("set-key"); x.add_argument("--from-env", action="store_true"); x.set_defaults(func=command_key)
+    x = sp.add_parser("api"); x.add_argument("--model"); x.set_defaults(func=command_api)
+    x = sp.add_parser("sub"); x.set_defaults(func=command_sub)
+    x = sp.add_parser("status"); x.set_defaults(func=command_status)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
