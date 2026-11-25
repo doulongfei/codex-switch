@@ -58,7 +58,7 @@ def say(message):
 
 
 def ensure_private_dir(path):
-    if path.exists() and path.is_symlink():
+    if path.is_symlink():
         die("管理目录不能是软连接：" + str(path))
     path.mkdir(parents=True, exist_ok=True)
     try:
@@ -262,7 +262,7 @@ def managed_target_mode(auth_path, p):
     try:
         resolved = auth_path.resolve(strict=True)
     except (OSError, RuntimeError):
-        die("auth.json 是失效或循环软连接；为保护凭证，未修改。")
+        return "broken-link"
     for mode, target in (("sub", p["subscription"]), ("api", p["api"])):
         if resolved == target.resolve(strict=False):
             return mode
@@ -305,6 +305,8 @@ def adopt_current_auth(p):
         return None
 
     current_mode = managed_target_mode(auth_path, p)
+    if current_mode == "broken-link":
+        die("auth.json 是失效或循环软连接；未执行迁移。")
     if current_mode:
         target = p["subscription"] if current_mode == "sub" else p["api"]
         mode, _, _ = classify_auth_file(target)
@@ -370,6 +372,8 @@ def current_mode(p):
     auth_path = p["auth"]
     if auth_path.is_symlink():
         mode = managed_target_mode(auth_path, p)
+        if mode == "broken-link":
+            return "broken-link"
         if mode is None:
             try:
                 target = auth_path.resolve(strict=True)
@@ -523,6 +527,8 @@ def command_uninstall(args):
     with switch_lock(p["lock"] if p["data"].exists() else p["home"] / ".codex-switch.lock"):
         if p["auth"].is_symlink():
             mode = managed_target_mode(p["auth"], p)
+            if mode == "broken-link":
+                die("auth.json 是失效或循环软连接；为保护凭证，未卸载。")
             if mode:
                 target = p["subscription"] if mode == "sub" else p["api"]
                 detected, content, error = classify_auth_file(target)
