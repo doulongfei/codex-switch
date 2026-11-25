@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/doulongfei/codex-switch/main/instal
 安装器会：
 
 1. 检查操作系统和 Python 版本（Python 3.8+）。
-2. 下载命令行程序并校验 SHA-256。
+2. 下载命令行程序。
 3. 安装到 `~/.local/bin/codex-switch`（可通过 `CODEX_SWITCH_INSTALL_DIR` 自定义）。
 4. 备份现有 `~/.codex/config.toml`，注册 OpenAI API 自定义 Provider。
 
