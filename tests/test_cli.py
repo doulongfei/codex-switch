@@ -213,6 +213,14 @@ class CodexSwitchTests(unittest.TestCase):
         self.assertFalse(self.auth.exists())
         self.assertFalse(self.auth.is_symlink())
 
+    def test_status_reports_broken_symlink_without_touching_it(self):
+        self.codex_home.mkdir(parents=True)
+        (self.codex_home / "codex-switch").mkdir()
+        os.symlink("codex-switch/missing-auth.json", self.auth)
+        result = self.run_cli("status")
+        self.assertIn("broken symlink", result.stdout)
+        self.assertTrue(self.auth.is_symlink())
+
     def test_sub_recovers_link_removed_by_codex_logout(self):
         self.write_auth(CHATGPT_AUTH)
         self.run_cli("_install")
