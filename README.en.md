@@ -8,7 +8,7 @@ A minimal CLI for switching Codex between ChatGPT subscription authentication an
 curl -fsSL https://raw.githubusercontent.com/doulongfei/codex-switch/main/install.sh | bash
 ```
 
-The installer checks the OS and Python 3.8+, downloads the CLI, verifies its SHA-256 checksum, installs it to `~/.local/bin`, and registers the custom OpenAI API provider in your Codex user config.
+The installer checks the OS and Python 3.8+, downloads the CLI and installs it to `~/.local/bin`, and registers the custom OpenAI API provider in your Codex user config.
 
 ## Quick start
 
