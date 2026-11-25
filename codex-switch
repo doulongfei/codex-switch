@@ -223,7 +223,11 @@ def auth_storage_info(p):
             if env_match:
                 env_vars = [item.strip() for item in env_match.group(1).split(",") if item.strip()]
             if match:
-                return match.group(1).lower(), env_vars
+                env_vars.extend(
+                    name for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
+                    if os.environ.get(name)
+                )
+                return match.group(1).lower(), sorted(set(env_vars))
         except (OSError, subprocess.TimeoutExpired):
             pass
 
@@ -514,6 +518,8 @@ def command_uninstall(args):
     p = paths()
     p["home"].mkdir(parents=True, exist_ok=True)
     require_file_backend(p)
+    if p["data"].exists() or p["data"].is_symlink():
+        ensure_private_dir(p["data"])
     with switch_lock(p["lock"] if p["data"].exists() else p["home"] / ".codex-switch.lock"):
         if p["auth"].is_symlink():
             mode = managed_target_mode(p["auth"], p)
