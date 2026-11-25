@@ -10,7 +10,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ['3.11']
+        python-version: ['3.8', '3.11', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run integration tests
         run: python -m unittest discover -s tests -v
-      - name: Check CLI help and syntax
+      - name: Check CLI syntax and help
         run: |
           python -m py_compile codex-switch
           python codex-switch --help
+          python codex-switch --version
+      - name: Check installer shell syntax
+        run: bash -n install.sh
