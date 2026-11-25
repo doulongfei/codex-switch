@@ -38,18 +38,6 @@ fi
 say "检测到 ${OS}，安装目录：${INSTALL_DIR}"
 mkdir -p "$TMP_DIR" "$INSTALL_DIR"
 download "${RAW_BASE}/codex-switch" "$TMP_DIR/codex-switch" || die "下载 codex-switch 失败。"
-download "${RAW_BASE}/codex-switch.sha256" "$TMP_DIR/codex-switch.sha256" || die "下载校验文件失败。"
-
-EXPECTED="$(awk 'NR == 1 {print $1}' "$TMP_DIR/codex-switch.sha256")"
-[ -n "$EXPECTED" ] || die "校验文件格式错误。"
-if command -v sha256sum >/dev/null 2>&1; then
-  ACTUAL="$(sha256sum "$TMP_DIR/codex-switch" | awk '{print $1}')"
-elif command -v shasum >/dev/null 2>&1; then
-  ACTUAL="$(shasum -a 256 "$TMP_DIR/codex-switch" | awk '{print $1}')"
-else
-  die "找不到 sha256sum 或 shasum，无法校验下载文件。"
-fi
-[ "$EXPECTED" = "$ACTUAL" ] || die "SHA-256 校验失败，拒绝安装。"
 
 chmod 755 "$TMP_DIR/codex-switch"
 install -m 755 "$TMP_DIR/codex-switch" "$TARGET"
