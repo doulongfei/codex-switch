@@ -1,269 +1,572 @@
 #!/usr/bin/env python3
-"""Switch Codex between its existing ChatGPT login and the official OpenAI API."""
+"""Switch Codex's native ChatGPT OAuth and OpenAI API-key credentials."""
+
 import argparse
 import getpass
 import json
 import os
+import re
 import shutil
-import stat
+import subprocess
 import sys
 import tempfile
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = "1.1.0"
-PROVIDER = "codex_switch_openai_api"
-BEGIN = "# >>> codex-switch managed provider: begin >>>"
-END = "# <<< codex-switch managed provider: end <<<"
+VERSION = "2.0.0"
+SUBSCRIPTION_FILE = "auth-subscription.json"
+API_FILE = "auth-api.json"
+STATE_FILE = "state.json"
+LOCK_FILE = "switch.lock"
+BACKUP_FILE = "auth.json.codex-switch.bak"
+SUPPORTED_AUTH_MODES = {"chatgpt", "apikey"}
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - this project targets macOS and Linux
+    fcntl = None
+
+
+def codex_home():
+    raw = os.environ.get("CODEX_HOME")
+    return Path(raw).expanduser().absolute() if raw else (Path.home() / ".codex")
 
 
 def paths():
-    home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    home = codex_home()
     data = home / "codex-switch"
-    return home / "config.toml", data, data / "openai-api-key", data / "state.json"
+    return {
+        "home": home,
+        "data": data,
+        "auth": home / "auth.json",
+        "subscription": data / SUBSCRIPTION_FILE,
+        "api": data / API_FILE,
+        "state": data / STATE_FILE,
+        "lock": data / LOCK_FILE,
+        "backup": data / BACKUP_FILE,
+    }
 
 
-def die(message):
+def die(message, code=1):
     print("codex-switch: " + message, file=sys.stderr)
-    raise SystemExit(1)
+    raise SystemExit(code)
 
 
-def read(path):
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+def say(message):
+    print("[codex-switch] " + message)
 
 
-def atomic_write(path, value, mode=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+def ensure_private_dir(path):
+    if path.exists() and path.is_symlink():
+        die("管理目录不能是软连接：" + str(path))
+    path.mkdir(parents=True, exist_ok=True)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(value)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        os.chmod(path, 0o700)
+    except OSError as exc:
+        die("无法设置管理目录权限：" + str(exc))
+
+
+def fsync_directory(path):
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def atomic_write_bytes(path, content, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, str(path))
+        fsync_directory(path.parent)
     except Exception:
         try:
-            os.unlink(tmp)
+            os.unlink(temporary)
         except OSError:
             pass
         raise
 
 
-def root_value(text, key):
-    in_table = False
-    found = []
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("["):
-            in_table = True
-        if not in_table and s.startswith(key + " ="):
-            try:
-                found.append(json.loads(s.split("=", 1)[1].split("#", 1)[0].strip()))
-            except Exception:
-                die("无法安全解析 config.toml 的顶层 " + key + " 配置")
-    if len(found) > 1:
-        die("config.toml 存在重复的顶层 " + key + " 配置")
-    return (True, found[0]) if found else (False, None)
+def atomic_symlink(auth_path, target):
+    """Atomically replace auth.json with a relative symlink to a managed file."""
+    relative_target = os.path.relpath(str(target), str(auth_path.parent))
+    temporary = auth_path.with_name(".auth.json.codex-switch." + uuid.uuid4().hex)
+    try:
+        os.symlink(relative_target, str(temporary))
+        os.replace(str(temporary), str(auth_path))
+        fsync_directory(auth_path.parent)
+    finally:
+        try:
+            if temporary.is_symlink() or temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
 
 
-def set_root(text, key, value):
-    lines = text.splitlines()
-    in_table = False
-    index = None
-    first_table = None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s.startswith("["):
-            in_table = True
-            if first_table is None:
-                first_table = i
-        if not in_table and s.startswith(key + " ="):
-            if index is not None:
-                die("config.toml 存在重复的顶层 " + key + " 配置")
-            index = i
-    if index is not None:
-        if value is None:
-            del lines[index]
-        else:
-            lines[index] = key + " = " + json.dumps(value) 
-    elif value is not None:
-        line = key + " = " + json.dumps(value)
-        if first_table is None:
-            lines.append(line)
-        else:
-            lines.insert(first_table, line)
-    return "\n".join(lines) + ("\n" if lines else "")
+@contextmanager
+def switch_lock(lock_path):
+    if fcntl is None:
+        die("当前平台不支持文件锁；本工具仅支持 macOS 和 Linux。")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
-def provider_block():
-    command = str(Path(sys.argv[0]).resolve())
-    _, data, key, _ = paths()
-    return "\n".join([
-        BEGIN,
-        "[model_providers." + PROVIDER + "]",
-        'name = "OpenAI API (codex-switch)"',
-        'base_url = "https://api.openai.com/v1"',
-        'wire_api = "responses"',
-        "",
-        "[model_providers." + PROVIDER + ".auth]",
-        "command = " + json.dumps(command),
-        'args = ["print-api-key", "--key-file", ' + json.dumps(str(key)) + "]",
-        "timeout_ms = 5000",
-        "refresh_interval_ms = 0",
-        END,
-    ])
+def read_bytes(path):
+    with open(str(path), "rb") as stream:
+        return stream.read()
 
 
-def register_provider(text):
-    block = provider_block()
-    if (BEGIN in text) != (END in text):
-        die("检测到不完整的 codex-switch 配置标记，拒绝修改")
-    if BEGIN in text:
-        a, b = text.index(BEGIN), text.index(END) + len(END)
-        return text[:a] + block + text[b:]
-    if "[model_providers." + PROVIDER + "]" in text:
-        die("Provider 已存在但不属于 codex-switch，拒绝覆盖")
-    return text.rstrip() + ("\n\n" if text.strip() else "") + block + "\n"
+def classify_auth_bytes(content):
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except Exception:
+        return None, None, "auth.json 不是有效的 UTF-8 JSON"
+    if not isinstance(payload, dict):
+        return None, None, "auth.json 顶层必须是 JSON object"
+
+    mode = payload.get("auth_mode")
+    api_key = payload.get("OPENAI_API_KEY")
+    tokens = payload.get("tokens")
+
+    if mode is None and api_key and isinstance(tokens, dict):
+        return None, payload, "auth.json 同时包含 API Key 和 OAuth tokens，认证类型不明确；未执行迁移"
+
+    if mode == "apikey" or (mode is None and api_key):
+        if not isinstance(api_key, str) or not api_key.strip():
+            return None, payload, "API Key 凭证缺少有效的 OPENAI_API_KEY"
+        return "api", payload, None
+
+    if mode == "chatgpt" or (mode is None and isinstance(tokens, dict)):
+        if not isinstance(tokens, dict):
+            return None, payload, "ChatGPT OAuth 凭证缺少 tokens 对象"
+        if not any(isinstance(tokens.get(k), str) and tokens.get(k).strip()
+                   for k in ("access_token", "refresh_token", "id_token")):
+            return None, payload, "ChatGPT OAuth tokens 中没有可用 Token"
+        return "sub", payload, None
+
+    if mode == "chatgptAuthTokens":
+        return None, payload, "检测到外部托管的 chatgptAuthTokens；当前版本只管理 Codex 原生 OAuth 登录"
+    if mode in ("agentIdentity", "personalAccessToken", "headers", "bedrockApiKey", "bedrockAccessKeys"):
+        return None, payload, "当前认证类型为 %s，codex-switch 不会迁移或覆盖此类凭证" % mode
+    return None, payload, "无法识别 auth.json 的认证类型；为保护现有凭证，未执行迁移"
 
 
-def load_state(path):
-    if not path.exists():
+def classify_auth_file(path):
+    try:
+        content = read_bytes(path)
+    except OSError as exc:
+        die("无法读取认证文件 %s：%s" % (path, exc))
+    mode, payload, error = classify_auth_bytes(content)
+    if error:
+        die(error)
+    return mode, content, payload
+
+
+def top_level_config_value(config_path, key):
+    if not config_path.exists():
         return None
     try:
-        return json.loads(read(path))
-    except Exception:
-        die("切换状态文件损坏，拒绝自动恢复")
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        die("无法读取 config.toml：" + str(exc))
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            break
+        match = re.match(r"^" + re.escape(key) + r"\s*=\s*['\"]([^'\"]+)['\"]\s*(?:#.*)?$", stripped)
+        if match:
+            return match.group(1).lower()
+    return None
 
 
-def save_state(path, state):
-    atomic_write(path, json.dumps(state, indent=2) + "\n")
+def auth_storage_info(p):
+    """Return the configured storage mode and auth environment variable names.
+
+    `codex doctor` is authoritative when available because managed policy can
+    override the local config. If Codex exists but its effective mode cannot be
+    inspected, fail closed instead of assuming that the auth file is active.
+    """
+    codex = shutil.which("codex")
+    if codex:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(p["home"])
+        try:
+            result = subprocess.run([codex, "doctor"], env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    timeout=20, check=False)
+            output = result.stdout or ""
+            match = re.search(r"auth storage mode\s+([A-Za-z]+)", output, re.IGNORECASE)
+            env_match = re.search(r"auth env vars present:\s*(.+)", output, re.IGNORECASE)
+            env_vars = []
+            if env_match:
+                env_vars = [item.strip() for item in env_match.group(1).split(",") if item.strip()]
+            if match:
+                return match.group(1).lower(), env_vars
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    configured = top_level_config_value(p["home"] / "config.toml", "cli_auth_credentials_store")
+    if configured:
+        return configured, []
+    if codex:
+        return "unknown", []
+    return "file", []  # Codex's current default in its packaged defaults.toml.
+
+
+def require_file_backend(p):
+    mode, doctor_env_vars = auth_storage_info(p)
+    if mode != "file":
+        die("当前 Codex 凭证存储模式为 %s；软连接切换仅支持 file。请先确认并切换到 cli_auth_credentials_store = \"file\"，不要让工具自动迁移 Keyring。" % mode)
+    auth_env_vars = sorted(set(doctor_env_vars) | {
+        name for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
+        if os.environ.get(name)
+    })
+    if auth_env_vars:
+        die("检测到认证环境变量 %s，可能覆盖 auth.json。请在运行 codex-switch 前取消这些变量。" % ", ".join(auth_env_vars))
+    return mode
+
+
+def ensure_data_dir(p):
+    ensure_private_dir(p["data"])
+
+
+def managed_target_mode(auth_path, p):
+    if not auth_path.is_symlink():
+        return None
+    try:
+        resolved = auth_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        die("auth.json 是失效或循环软连接；为保护凭证，未修改。")
+    for mode, target in (("sub", p["subscription"]), ("api", p["api"])):
+        if resolved == target.resolve(strict=False):
+            return mode
+    return None
+
+
+def save_initial_backup(p, content):
+    if not p["backup"].exists():
+        atomic_write_bytes(p["backup"], content, 0o600)
+
+
+def set_state(p, active_mode):
+    state = {
+        "schema_version": 1,
+        "active_mode": active_mode,
+    }
+    atomic_write_bytes(p["state"], (json.dumps(state, indent=2) + "\n").encode("utf-8"), 0o600)
+
+
+def load_state(p):
+    try:
+        value = json.loads(read_bytes(p["state"]).decode("utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def import_auth_content(p, content, mode, backup=False):
+    target = p["subscription"] if mode == "sub" else p["api"]
+    if backup:
+        save_initial_backup(p, content)
+    atomic_write_bytes(target, content, 0o600)
+    return target
+
+
+def adopt_current_auth(p):
+    """Import a regular/external auth.json into the matching managed file and link it."""
+    auth_path = p["auth"]
+    if not auth_path.exists() and not auth_path.is_symlink():
+        return None
+
+    current_mode = managed_target_mode(auth_path, p)
+    if current_mode:
+        target = p["subscription"] if current_mode == "sub" else p["api"]
+        mode, _, _ = classify_auth_file(target)
+        if mode != current_mode:
+            die("管理凭证文件类型与软连接目标不一致，拒绝切换。")
+        set_state(p, current_mode)
+        return current_mode
+
+    if auth_path.is_symlink():
+        try:
+            source = auth_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            die("auth.json 是失效或循环软连接；未执行迁移。")
+        if not source.is_file():
+            die("auth.json 软连接目标不是普通文件；未执行迁移。")
+    else:
+        source = auth_path
+        if not source.is_file():
+            die("auth.json 不是普通文件或软连接；未执行迁移。")
+
+    mode, content, _ = classify_auth_file(source)
+    target = import_auth_content(p, content, mode, backup=True)
+    atomic_symlink(auth_path, target)
+    set_state(p, mode)
+    return mode
+
+
+def ensure_managed_layout(p):
+    ensure_data_dir(p)
+    if p["auth"].exists() or p["auth"].is_symlink():
+        return adopt_current_auth(p)
+
+    # `codex logout` removes the auth.json symlink, not the managed target.
+    state = load_state(p)
+    previous = state.get("active_mode")
+    if previous == "sub" and p["subscription"].is_file():
+        atomic_symlink(p["auth"], p["subscription"])
+        return "sub"
+    if previous == "api" and p["api"].is_file():
+        atomic_symlink(p["auth"], p["api"])
+        return "api"
+    return None
 
 
 def command_install(args):
-    config, data, key, state = paths()
-    data.mkdir(parents=True, exist_ok=True)
-    os.chmod(data, 0o700)
-    target_dir = Path(args.bin_dir or Path.home() / ".local/bin").expanduser()
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / "codex-switch"
-    source = Path(__file__).resolve()
-    if source != target.resolve():
-        shutil.copy2(source, target)
-    os.chmod(target, 0o755)
-    original = read(config)
-    backup = config.with_name("config.toml.codex-switch.bak")
-    if config.exists() and not backup.exists():
-        shutil.copy2(config, backup)
-        os.chmod(backup, 0o600)
-    updated = register_provider(original)
-    atomic_write(config, updated)
-    print("codex-switch 已安装。")
-    print("命令位置：" + str(target))
-    print("下一步：codex-switch set-key")
-
-
-def command_key(args):
-    config, data, key, state = paths()
-    data.mkdir(parents=True, exist_ok=True)
-    os.chmod(data, 0o700)
-    if args.from_env:
-        value = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not value:
-            die("环境变量 OPENAI_API_KEY 未设置")
+    p = paths()
+    p["home"].mkdir(parents=True, exist_ok=True)
+    ensure_data_dir(p)
+    require_file_backend(p)
+    with switch_lock(p["lock"]):
+        mode = ensure_managed_layout(p)
+    if mode == "sub":
+        say("已复用现有 ChatGPT OAuth；auth.json 已链接到 auth-subscription.json。")
+    elif mode == "api":
+        say("检测到现有 OpenAI API Key；已将认证纳入管理。")
     else:
-        value = getpass.getpass("OpenAI Platform API Key（输入不回显）：").strip()
-        confirm = getpass.getpass("再次输入 API Key：").strip()
-        if value != confirm:
-            die("两次输入的 API Key 不一致")
-    if not value or any(c.isspace() for c in value):
-        die("API Key 为空或格式异常")
-    atomic_write(key, value + "\n")
-    print("API Key 已安全保存（文件权限 600）。")
+        say("没有检测到现有 auth.json；CLI 已安装，现有 Codex 登录状态未改变。")
+        say("请先使用 codex login 登录，或执行 codex-switch setup-api 配置 API Key。")
+    say("初始化完成；未修改 config.toml，也未执行 codex logout。")
 
 
-def command_print_key(args):
-    _, _, default_key, _ = paths()
-    key = Path(args.key_file).expanduser() if args.key_file else default_key
-    if not key.is_file():
-        die("API Key 未配置，请先运行 codex-switch set-key")
-    value = read(key).strip()
-    if not value:
-        die("API Key 文件为空")
-    print(value)
+def current_mode(p):
+    auth_path = p["auth"]
+    if auth_path.is_symlink():
+        mode = managed_target_mode(auth_path, p)
+        if mode is None:
+            try:
+                target = auth_path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                return "broken-link"
+            if not target.is_file():
+                return "broken-link"
+            detected, _, error = classify_auth_bytes(read_bytes(target))
+            return detected or "unsupported"
+        target = p["subscription"] if mode == "sub" else p["api"]
+        detected, _, error = classify_auth_bytes(read_bytes(target))
+        return mode if detected == mode else "invalid-managed-auth"
+    if auth_path.exists() and auth_path.is_file():
+        mode, _, error = classify_auth_bytes(read_bytes(auth_path))
+        return mode or "unsupported"
+    return "missing"
+
+
+def switch_to(p, mode):
+    require_file_backend(p)
+    ensure_data_dir(p)
+    with switch_lock(p["lock"]):
+        # If auth.json is a regular file (for example after a fresh `codex login`),
+        # import it before switching. If it is already a managed symlink, Codex
+        # writes refreshed OAuth tokens through that symlink to the managed target.
+        if p["auth"].exists() or p["auth"].is_symlink():
+            adopt_current_auth(p)
+        target = p["subscription"] if mode == "sub" else p["api"]
+        if not target.is_file():
+            if mode == "api":
+                die("尚未配置 OpenAI API Key；请先运行 codex-switch setup-api。")
+            die("没有找到 ChatGPT OAuth 凭证。请先运行 codex login，再执行 codex-switch sub。")
+        detected, _, error = classify_auth_file(target)
+        if detected != mode:
+            die("目标凭证文件类型不正确，拒绝切换。")
+        atomic_symlink(p["auth"], target)
+        set_state(p, mode)
+    if mode == "api":
+        say("已切换到 OpenAI API Key。")
+    else:
+        say("已切换到 ChatGPT OAuth 订阅。")
+    say("请完全退出并重新启动 Codex Desktop；正在运行的会话不会热切换。")
 
 
 def command_api(args):
-    config, data, key, state_path = paths()
-    if not config.exists():
-        die("找不到 config.toml，请先运行 codex-switch install")
-    if not key.is_file():
-        die("API Key 未配置，请先运行 codex-switch set-key")
-    text = read(config)
-    active, profile = root_value(text, "profile")
-    if active and profile:
-        die("检测到顶层 profile 配置；当前版本不自动修改 Profile")
-    present, old_provider = root_value(text, "model_provider")
-    state = load_state(state_path)
-    if old_provider != PROVIDER:
-        _, old_model = root_value(text, "model")
-        model_present, _ = root_value(text, "model")
-        state = {"provider_present": present, "provider": old_provider,
-                 "model_present": model_present, "model": old_model,
-                 "model_override": bool(args.model)}
-    elif state is None:
-        die("当前已是 API Provider，但缺少恢复状态")
-    if args.model:
-        text = set_root(text, "model", args.model)
-        state["model_override"] = True
-    text = set_root(text, "model_provider", PROVIDER)
-    save_state(state_path, state)
-    atomic_write(config, text)
-    print("已切换到 OpenAI 官方 API Provider。")
-    print("请完全退出并重新启动 Codex Desktop；运行中的会话不会热切换。")
+    switch_to(paths(), "api")
 
 
 def command_sub(args):
-    config, data, key, state_path = paths()
-    text = read(config)
-    state = load_state(state_path)
-    if not state:
-        die("没有可恢复的切换状态")
-    text = set_root(text, "model_provider", state["provider"] if state["provider_present"] else None)
-    if state.get("model_override"):
-        text = set_root(text, "model", state["model"] if state["model_present"] else None)
-    atomic_write(config, text)
-    state_path.unlink(missing_ok=True)
-    print("已恢复切换前的 Provider。ChatGPT 登录凭证未被修改。")
-    print("Codex Desktop 需要完全退出并重新启动。")
+    switch_to(paths(), "sub")
+
+
+def command_setup_api(args):
+    p = paths()
+    require_file_backend(p)
+    ensure_data_dir(p)
+    with switch_lock(p["lock"]):
+        current = ensure_managed_layout(p)
+
+    codex = shutil.which("codex")
+    if not codex:
+        die("未找到 Codex CLI（codex）。请先安装 Codex CLI，再运行 setup-api。")
+
+    key = getpass.getpass("OpenAI Platform API Key（输入不回显）：").strip()
+    confirm = getpass.getpass("再次输入 API Key：").strip()
+    if not key:
+        die("API Key 不能为空。")
+    if key != confirm:
+        die("两次输入的 API Key 不一致。")
+    if any(char.isspace() for char in key):
+        die("API Key 格式异常：不能包含空白字符。")
+
+    staging = Path(tempfile.mkdtemp(prefix=".api-login-", dir=str(p["data"])))
+    os.chmod(staging, 0o700)
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(staging)
+    # Ensure the staging login is driven by the key supplied on stdin, not an
+    # inherited environment credential.
+    env.pop("OPENAI_API_KEY", None)
+    env.pop("CODEX_API_KEY", None)
+    env.pop("CODEX_ACCESS_TOKEN", None)
+    try:
+        result = subprocess.run(
+            [codex, "login", "--with-api-key"],
+            input=key + "\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=90,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Codex 登录命令失败").strip()
+            detail = detail.replace(key, "[REDACTED]")
+            die("Codex 原生 API Key 登录失败：" + detail)
+        staged_auth = staging / "auth.json"
+        if not staged_auth.is_file():
+            die("Codex 登录命令成功，但没有生成 auth.json；未更新现有凭证。")
+        mode, content, payload = classify_auth_file(staged_auth)
+        if mode != "api" or payload.get("OPENAI_API_KEY") != key:
+            die("Codex 生成的凭证与输入的 API Key 不匹配；未更新现有凭证。")
+        with switch_lock(p["lock"]):
+            atomic_write_bytes(p["api"], content, 0o600)
+            # If there was no active auth before setup, activate the newly created
+            # API credential. Existing subscription remains the active mode.
+            if current is None and not (p["auth"].exists() or p["auth"].is_symlink()):
+                atomic_symlink(p["auth"], p["api"])
+                set_state(p, "api")
+        say("OpenAI API Key 已通过 Codex 原生登录流程保存。")
+        say("当前订阅认证未被覆盖。使用 codex-switch api 切换到 API 模式。")
+    except subprocess.TimeoutExpired:
+        die("Codex API Key 登录超时；现有凭证未修改。")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def command_status(args):
-    config, data, key, state = paths()
-    text = read(config)
-    present, provider = root_value(text, "model_provider")
-    print("Codex 配置：" + str(config))
-    print("当前模式：" + ("OpenAI API" if provider == PROVIDER else "订阅/其他 Provider"))
-    print("API Key：" + ("已配置" if key.is_file() and key.stat().st_size else "未配置"))
-    print("Provider：" + ("已注册" if BEGIN in text and END in text else "未注册"))
+    p = paths()
+    mode = current_mode(p)
+    storage, env_auth_vars = auth_storage_info(p)
+    print("Codex home: " + str(p["home"]))
+    print("Auth storage mode: " + storage.capitalize())
+    if env_auth_vars:
+        print("Auth env vars present: " + ", ".join(env_auth_vars))
+    if p["auth"].is_symlink():
+        try:
+            link = os.readlink(str(p["auth"]))
+        except OSError:
+            link = "<unreadable>"
+        print("auth.json: symlink -> " + link)
+    elif p["auth"].exists():
+        print("auth.json: regular file (not managed by codex-switch)")
+    else:
+        print("auth.json: missing")
+    labels = {"sub": "ChatGPT OAuth subscription", "api": "OpenAI API Key",
+              "missing": "not configured", "broken-link": "broken symlink",
+              "unsupported": "unsupported authentication", "invalid-managed-auth": "invalid managed credential"}
+    print("Current mode: " + labels.get(mode, mode))
+    print("Subscription credential: " + ("available" if p["subscription"].is_file() else "not configured"))
+    print("API credential: " + ("available" if p["api"].is_file() else "not configured"))
+    print("config.toml: unchanged by codex-switch")
+
+
+def command_uninstall(args):
+    p = paths()
+    p["home"].mkdir(parents=True, exist_ok=True)
+    require_file_backend(p)
+    with switch_lock(p["lock"] if p["data"].exists() else p["home"] / ".codex-switch.lock"):
+        if p["auth"].is_symlink():
+            mode = managed_target_mode(p["auth"], p)
+            if mode:
+                target = p["subscription"] if mode == "sub" else p["api"]
+                detected, content, error = classify_auth_file(target)
+                if detected != mode:
+                    die("当前活动凭证无效；为避免丢失认证，未卸载。")
+                atomic_write_bytes(p["auth"], content, 0o600)
+                say("已将当前活动凭证恢复为普通 auth.json 文件。")
+            else:
+                die("auth.json 指向非 codex-switch 目标；为保护现有配置，未修改。")
+        else:
+            say("auth.json 不是 codex-switch 软连接，无需恢复。")
+    say("认证数据保留在 %s；请手动删除不再需要的凭证文件和 CLI。" % p["data"])
+    say("如需删除 CLI：rm -f ~/.local/bin/codex-switch")
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "print-api-key":
-        p = argparse.ArgumentParser()
-        p.add_argument("--key-file")
-        command_print_key(p.parse_args(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "_install":
+        command_install(None)
         return
-    p = argparse.ArgumentParser(prog="codex-switch")
-    p.add_argument("--version", action="version", version="codex-switch " + VERSION)
-    sp = p.add_subparsers(dest="cmd", required=True)
-    x = sp.add_parser("install"); x.add_argument("--bin-dir"); x.set_defaults(func=command_install)
-    x = sp.add_parser("set-key"); x.add_argument("--from-env", action="store_true"); x.set_defaults(func=command_key)
-    x = sp.add_parser("api"); x.add_argument("--model"); x.set_defaults(func=command_api)
-    x = sp.add_parser("sub"); x.set_defaults(func=command_sub)
-    x = sp.add_parser("status"); x.set_defaults(func=command_status)
-    args = p.parse_args()
+
+    parser = argparse.ArgumentParser(
+        prog="codex-switch",
+        description="在 Codex 原生 ChatGPT OAuth 与 OpenAI API Key 认证之间切换。",
+    )
+    parser.add_argument("--version", action="version", version="codex-switch " + VERSION)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    api_parser = subparsers.add_parser("api", help="切换到 OpenAI API Key")
+    api_parser.set_defaults(func=command_api)
+
+    sub_parser = subparsers.add_parser("sub", help="切换到 ChatGPT OAuth 订阅")
+    sub_parser.set_defaults(func=command_sub)
+
+    status_parser = subparsers.add_parser("status", help="查看当前认证模式")
+    status_parser.set_defaults(func=command_status)
+
+    setup_parser = subparsers.add_parser("setup-api", help="首次配置 OpenAI 官方 API Key")
+    setup_parser.set_defaults(func=command_setup_api)
+
+    uninstall_parser = subparsers.add_parser("uninstall", help="解除软连接并保留认证数据")
+    uninstall_parser.set_defaults(func=command_uninstall)
+
+    args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("操作已取消。", 130)
+    except OSError as exc:
+        die("系统操作失败：" + str(exc))
