@@ -16,7 +16,7 @@ die() { printf '[codex-switch] Error: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
   Darwin) OS="macOS" ;;
-  Linux) OS="Linux" ;;
+  Linux) OS="Linux/Ubuntu" ;;
   *) die "仅支持 macOS 和 Linux（Ubuntu）。当前系统：$(uname -s)" ;;
 esac
 
@@ -28,7 +28,7 @@ if sys.version_info < (3, 8):
 PY
 
 if command -v curl >/dev/null 2>&1; then
-  download() { curl --fail --location --silent --show-error "$1" --output "$2"; }
+  download() { curl --fail --location --silent --show-error --retry 2 "$1" --output "$2"; }
 elif command -v wget >/dev/null 2>&1; then
   download() { wget --quiet "$1" --output-document="$2"; }
 else
@@ -38,12 +38,25 @@ fi
 say "检测到 ${OS}，安装目录：${INSTALL_DIR}"
 mkdir -p "$TMP_DIR" "$INSTALL_DIR"
 download "${RAW_BASE}/codex-switch" "$TMP_DIR/codex-switch" || die "下载 codex-switch 失败。"
+download "${RAW_BASE}/codex-switch.sha256" "$TMP_DIR/codex-switch.sha256" || die "下载 SHA-256 校验文件失败。"
+
+EXPECTED="$(awk 'NR == 1 {print $1}' "$TMP_DIR/codex-switch.sha256")"
+[ -n "$EXPECTED" ] || die "SHA-256 校验文件为空或格式错误。"
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "$TMP_DIR/codex-switch" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL="$(shasum -a 256 "$TMP_DIR/codex-switch" | awk '{print $1}')"
+else
+  die "找不到 sha256sum 或 shasum，无法校验下载文件。"
+fi
+[ "$EXPECTED" = "$ACTUAL" ] || die "SHA-256 校验失败，拒绝安装。"
 
 chmod 755 "$TMP_DIR/codex-switch"
 install -m 755 "$TMP_DIR/codex-switch" "$TARGET"
+say "CLI 已安装：${TARGET}"
 
-say "已安装可执行文件：${TARGET}"
-"$TARGET" install --bin-dir "$INSTALL_DIR"
+# Installation includes detection and one-time migration of an existing auth.json.
+"$TARGET" _install
 
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
@@ -53,7 +66,6 @@ case ":${PATH}:" in
     ;;
 esac
 
-say "安装完成。下一步运行："
-printf '  %s set-key\n' "$TARGET"
-printf '  %s api\n' "$TARGET"
-say "切换后请完全退出并重新启动 Codex Desktop；CLI 新进程会读取新配置。"
+say "安装完成。首次配置 OpenAI API Key："
+printf '  %s setup-api\n' "$TARGET"
+say "切换命令：codex-switch sub | codex-switch api | codex-switch status"
